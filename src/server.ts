@@ -5,6 +5,9 @@ import helmet from '@fastify/helmet';
 import { Pool } from 'pg';
 import { z } from 'zod';
 import { registerAdminRoutes } from './admin.ts';
+import { DeepSeekAssistantProvider } from './providers/deepseek.ts';
+import { registerFanAuthRoutes } from './fan-auth.ts';
+import { registerFanRoutes } from './fan-routes.ts';
 
 const env = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -14,6 +17,12 @@ const env = z.object({
   DATABASE_SSL: z.string().default('false'),
   APP_ORIGINS: z.string().default('http://localhost:3000,http://localhost:5000,http://localhost:5173'),
   ADMIN_API_TOKEN: z.string().min(32).optional(),
+  AUTH_TOKEN_SECRET: z.string().min(32).optional(),
+  COMMUNITY_MEDIA_DIR: z.string().default('community-media'),
+  PUBLIC_API_BASE_URL: z.string().url().optional(),
+  AI_PROVIDER_API_KEY: z.string().optional(),
+  AI_PROVIDER_BASE_URL: z.string().url().default('https://api.deepseek.com/v1'),
+  AI_PROVIDER_MODEL: z.string().min(1).default('deepseek-chat'),
 }).parse(process.env);
 
 const app = Fastify({ logger: true, bodyLimit: 2 * 1024 * 1024 });
@@ -48,7 +57,7 @@ app.get('/api/v1', async () => ({
   resources: [
     'competitions', 'matches', 'match-events', 'lineups', 'match-statistics',
     'teams', 'players', 'standings', 'venues', 'news', 'events', 'media',
-    'assistant', 'translation',
+    'assistant', 'translation', 'auth', 'account', 'community',
   ],
 }));
 
@@ -131,15 +140,174 @@ for (const [resource, definition] of Object.entries(resources) as [ResourceName,
 }
 
 registerAdminRoutes(app, pool, env.ADMIN_API_TOKEN);
+registerFanAuthRoutes(app, pool, env.AUTH_TOKEN_SECRET);
+registerFanRoutes(app, pool, env.AUTH_TOKEN_SECRET, env.COMMUNITY_MEDIA_DIR, env.PUBLIC_API_BASE_URL);
 
-const askSchema = z.object({ question: z.string().trim().min(1).max(2000), language: z.string().default('en') });
+type AssistantFact = { text: string; source: string; updatedAt: string };
+type AssistantRow = Record<string, unknown>;
+
+async function loadAssistantFacts(database: Pool, question: string): Promise<AssistantFact[]> {
+  const query = question.toLowerCase();
+  const wantsMatches = /\b(match|fixture|kick.?off|score|result|playing|play|next|when)\b/.test(query);
+  const wantsStandings = /\b(standings?|table|group|points|qualified|qualify)\b/.test(query);
+  const wantsTeams = /\b(team|country|coach|squad|morocco|senegal|nigeria|egypt|uganda)\b/.test(query);
+  const wantsPlayers = /\b(player|scorer|goal.?scorer|goals|squad|captain)\b/.test(query);
+  const wantsVenues = /\b(venue|stadium|where|address|capacity|transport)\b/.test(query);
+  const wantsNews = /\b(news|article|latest|story)\b/.test(query);
+  const wantsEvents = /\b(event|fan.?zone|festival)\b/.test(query);
+  const useDefaultFacts = !(
+    wantsMatches || wantsStandings || wantsTeams || wantsPlayers ||
+    wantsVenues || wantsNews || wantsEvents
+  );
+  const includeMatches = wantsMatches || wantsVenues || useDefaultFacts;
+  const includeStandings = wantsStandings || useDefaultFacts;
+  const includeTeams = wantsTeams || wantsPlayers || useDefaultFacts;
+
+  const factGroups = await Promise.all([
+    ...(includeMatches ? [database.query<AssistantRow>(
+      `SELECT c.name AS competition, home.name AS home_team, away.name AS away_team,
+              m.kickoff_at, m.status, m.home_score, m.away_score, v.name AS venue,
+              m.source_name, m.source_updated_at
+       FROM matches m
+       JOIN competitions c ON c.id = m.competition_id
+       JOIN teams home ON home.id = m.home_team_id
+       JOIN teams away ON away.id = m.away_team_id
+       LEFT JOIN venues v ON v.id = m.venue_id
+       WHERE m.published = TRUE
+         AND m.kickoff_at >= NOW() - INTERVAL '30 days'
+       ORDER BY CASE WHEN m.kickoff_at >= NOW() THEN 0 ELSE 1 END,
+                ABS(EXTRACT(EPOCH FROM (m.kickoff_at - NOW())))
+       LIMIT 12`,
+    ).then(({ rows }) => rows.map((row): AssistantFact => ({
+      text: `${row.competition}: ${row.home_team} vs ${row.away_team}; kickoff ${new Date(String(row.kickoff_at)).toISOString()}; status ${row.status}; score ${row.home_score ?? 'not available'}-${row.away_score ?? 'not available'}${row.venue ? `; venue ${row.venue}` : ''}.`,
+      source: `Match schedule: ${row.home_team} vs ${row.away_team}${row.source_name ? ` (${row.source_name})` : ''}`,
+      updatedAt: row.source_updated_at ? new Date(String(row.source_updated_at)).toISOString() : 'not provided',
+    }))) ] : []),
+    ...(includeStandings ? [database.query<AssistantRow>(
+      `SELECT c.name AS competition, s.group_code, s.position, t.name AS team,
+              s.played, s.won, s.drawn, s.lost, s.goals_for, s.goals_against,
+              s.goal_difference, s.points, s.source_updated_at
+       FROM standings s
+       JOIN competitions c ON c.id = s.competition_id
+       JOIN teams t ON t.id = s.team_id
+       WHERE s.published = TRUE
+       ORDER BY c.name, s.group_code, s.position
+       LIMIT 32`,
+    ).then(({ rows }) => rows.map((row): AssistantFact => ({
+      text: `${row.competition}, Group ${row.group_code}: ${row.team} is #${row.position}; ${row.played} played, ${row.won} wins, ${row.drawn} draws, ${row.lost} losses, goals ${row.goals_for}-${row.goals_against}, goal difference ${row.goal_difference}, ${row.points} points.`,
+      source: `Standings: ${row.competition}, Group ${row.group_code}`,
+      updatedAt: row.source_updated_at ? new Date(String(row.source_updated_at)).toISOString() : 'not provided',
+    }))) ] : []),
+    ...(includeTeams ? [database.query<AssistantRow>(
+      `SELECT t.name, t.short_name, t.country_code, t.region, t.coach, c.name AS competition,
+              t.source_name, t.source_updated_at
+       FROM teams t
+       LEFT JOIN competitions c ON c.id = t.competition_id
+       WHERE t.published = TRUE
+       ORDER BY t.name
+       LIMIT 24`,
+    ).then(({ rows }) => rows.map((row): AssistantFact => ({
+      text: `${row.name}${row.short_name ? ` (${row.short_name})` : ''}${row.country_code ? `, country code ${row.country_code}` : ''}${row.region ? `, region ${row.region}` : ''}${row.coach ? `, coach ${row.coach}` : ''}${row.competition ? `, competition ${row.competition}` : ''}.`,
+      source: `Team profile: ${row.name}${row.source_name ? ` (${row.source_name})` : ''}`,
+      updatedAt: row.source_updated_at ? new Date(String(row.source_updated_at)).toISOString() : 'not provided',
+    }))) ] : []),
+    ...(wantsPlayers ? [database.query<AssistantRow>(
+      `SELECT p.name, p.position, p.shirt_number, p.club, t.name AS team,
+              c.name AS competition, p.stats, p.source_name, p.source_updated_at
+       FROM players p
+       LEFT JOIN teams t ON t.id = p.team_id
+       LEFT JOIN competitions c ON c.id = p.competition_id
+       WHERE p.published = TRUE
+       ORDER BY p.name
+       LIMIT 16`,
+    ).then(({ rows }) => rows.map((row): AssistantFact => ({
+      text: `${row.name}${row.position ? `, position ${row.position}` : ''}${row.shirt_number ? `, shirt ${row.shirt_number}` : ''}${row.team ? `, team ${row.team}` : ''}${row.club ? `, club ${row.club}` : ''}${row.competition ? `, competition ${row.competition}` : ''}${row.stats && Object.keys(row.stats as object).length ? `, statistics ${JSON.stringify(row.stats)}` : ''}.`,
+      source: `Player profile: ${row.name}${row.source_name ? ` (${row.source_name})` : ''}`,
+      updatedAt: row.source_updated_at ? new Date(String(row.source_updated_at)).toISOString() : 'not provided',
+    }))) ] : []),
+    ...(wantsVenues ? [database.query<AssistantRow>(
+      `SELECT name, city, country, address, capacity, accessibility_info,
+              transport_info, timezone, source_name, source_updated_at
+       FROM venues
+       WHERE published = TRUE
+       ORDER BY name
+       LIMIT 12`,
+    ).then(({ rows }) => rows.map((row): AssistantFact => ({
+      text: `${row.name}, ${row.city}${row.country ? `, ${row.country}` : ''}${row.address ? `; address ${row.address}` : ''}${row.capacity ? `; capacity ${row.capacity}` : ''}${row.timezone ? `; timezone ${row.timezone}` : ''}${row.accessibility_info ? `; accessibility ${row.accessibility_info}` : ''}${row.transport_info ? `; transport ${row.transport_info}` : ''}.`,
+      source: `Venue: ${row.name}${row.source_name ? ` (${row.source_name})` : ''}`,
+      updatedAt: row.source_updated_at ? new Date(String(row.source_updated_at)).toISOString() : 'not provided',
+    }))) ] : []),
+    ...(wantsNews ? [database.query<AssistantRow>(
+      `SELECT title, summary, category, region, source_name, published_at
+       FROM articles
+       WHERE published = TRUE
+       ORDER BY published_at DESC NULLS LAST
+       LIMIT 8`,
+    ).then(({ rows }) => rows.map((row): AssistantFact => ({
+      text: `${row.title}${row.summary ? `: ${row.summary}` : ''}${row.category ? `; category ${row.category}` : ''}${row.region ? `; region ${row.region}` : ''}.`,
+      source: `News: ${row.title}${row.source_name ? ` (${row.source_name})` : ''}`,
+      updatedAt: row.published_at ? new Date(String(row.published_at)).toISOString() : 'not provided',
+    }))) ] : []),
+    ...(wantsEvents ? [database.query<AssistantRow>(
+      `SELECT e.title, e.description, e.city, e.region, e.starts_at, e.ends_at,
+              v.name AS venue, e.organizer
+       FROM fan_events e
+       LEFT JOIN venues v ON v.id = e.venue_id
+       WHERE e.published = TRUE
+       ORDER BY e.starts_at
+       LIMIT 8`,
+    ).then(({ rows }) => rows.map((row): AssistantFact => ({
+      text: `${row.title}${row.description ? `: ${row.description}` : ''}; ${row.city}${row.region ? `, ${row.region}` : ''}; starts ${new Date(String(row.starts_at)).toISOString()}${row.ends_at ? `, ends ${new Date(String(row.ends_at)).toISOString()}` : ''}${row.venue ? `; venue ${row.venue}` : ''}${row.organizer ? `; organizer ${row.organizer}` : ''}.`,
+      source: `Fan event: ${row.title}`,
+      updatedAt: 'not provided',
+    }))) ] : []),
+  ]);
+  return factGroups.flat().slice(0, 48);
+}
+
+const assistant = env.AI_PROVIDER_API_KEY
+  ? new DeepSeekAssistantProvider(
+      env.AI_PROVIDER_API_KEY,
+      env.AI_PROVIDER_BASE_URL,
+      env.AI_PROVIDER_MODEL,
+    )
+  : undefined;
+const askSchema = z.object({
+  question: z.string().trim().min(1).max(2000),
+  language: z.string().trim().min(1).max(32).default('auto'),
+});
 app.post('/api/v1/assistant/ask', async (request, reply) => {
   const parsed = askSchema.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: 'invalid_request', details: parsed.error.flatten() });
-  return reply.code(503).send({
-    error: 'assistant_provider_not_configured',
-    message: 'Connect an AI provider and verified AFCON content before enabling answers.',
-  });
+  if (!assistant) {
+    return reply.code(503).send({
+      error: 'assistant_provider_not_configured',
+      message: 'Configure AI_PROVIDER_API_KEY in the backend environment to enable Ask AFCON.',
+    });
+  }
+  if (!pool) {
+    return reply.code(503).send({
+      error: 'database_not_configured',
+      message: 'Configure DATABASE_URL to answer from verified AFCON information.',
+    });
+  }
+
+  try {
+    const facts = await loadAssistantFacts(pool, parsed.data.question);
+    if (facts.length === 0) {
+      return reply.code(503).send({
+        error: 'assistant_content_unavailable',
+        message: 'There is no published AFCON information available to answer this question yet.',
+      });
+    }
+    return await assistant.answer({ ...parsed.data, facts });
+  } catch (error) {
+    request.log.error({ err: error }, 'Ask AFCON request failed');
+    return reply.code(502).send({
+      error: 'assistant_unavailable',
+      message: 'Ask AFCON could not complete the request. Please try again.',
+    });
+  }
 });
 
 const translationSchema = z.object({

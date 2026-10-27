@@ -126,6 +126,89 @@ export function registerAdminRoutes(app: FastifyInstance, pool: Pool | undefined
     }
   };
 
+  const moderationStatus = z.enum(['pending', 'published', 'hidden', 'removed']);
+  const moderationUpdate = z.object({ status: moderationStatus }).strict();
+  for (const resource of ['community-posts', 'community-comments'] as const) {
+    const table = resource === 'community-posts' ? 'community_posts' : 'community_comments';
+    const query = resource === 'community-posts'
+      ? `SELECT p.id, p.user_id, u.display_name, p.body AS content, p.status, p.created_at,
+                (SELECT COUNT(*)::int FROM community_post_likes l WHERE l.post_id = p.id) AS likes_count,
+                (SELECT COUNT(*)::int FROM community_comments c WHERE c.post_id = p.id) AS comments_count
+         FROM community_posts p JOIN app_users u ON u.id = p.user_id
+         ORDER BY p.created_at DESC LIMIT 250`
+      : `SELECT c.id, c.post_id, c.user_id, u.display_name, c.body AS content, c.status, c.created_at
+         FROM community_comments c JOIN app_users u ON u.id = c.user_id
+         ORDER BY c.created_at DESC LIMIT 250`;
+
+    app.get(`/api/v1/admin/${resource}`, { preHandler: authorize }, async (request, reply) => {
+      if (!pool) return reply.code(503).send({ error: 'database_not_configured' });
+      try {
+        const result = await pool.query(query);
+        return { data: result.rows, meta: { count: result.rowCount, limit: 250 } };
+      } catch (error) {
+        request.log.error({ err: error, resource }, 'community moderation list failed');
+        return reply.code(503).send({ error: 'data_unavailable' });
+      }
+    });
+
+    app.patch<{ Params: { id: string } }>(`/api/v1/admin/${resource}/:id`, { preHandler: authorize }, async (request, reply) => {
+      if (!pool) return reply.code(503).send({ error: 'database_not_configured' });
+      if (!uuid.safeParse(request.params.id).success) return reply.code(400).send({ error: 'invalid_id' });
+      const parsed = moderationUpdate.safeParse(request.body);
+      if (!parsed.success) return reply.code(400).send({ error: 'invalid_request', details: parsed.error.flatten() });
+      try {
+        const result = await pool.query(
+          `UPDATE ${table} SET status = $1 WHERE id = $2 RETURNING id, status`,
+          [parsed.data.status, request.params.id],
+        );
+        if (!result.rowCount) return reply.code(404).send({ error: 'record_not_found' });
+        return { data: result.rows[0] };
+      } catch (error) {
+        request.log.error({ err: error, resource }, 'community moderation update failed');
+        return reply.code(409).send({ error: 'record_not_updated' });
+      }
+    });
+  }
+
+  const reportStatus = z.enum(['open', 'resolved', 'dismissed']);
+  app.get('/api/v1/admin/community-reports', { preHandler: authorize }, async (request, reply) => {
+    if (!pool) return reply.code(503).send({ error: 'database_not_configured' });
+    try {
+      const result = await pool.query(`
+        SELECT r.id, r.post_id, r.comment_id, r.reporter_id,
+               u.display_name AS reporter_name, r.reason, r.status, r.created_at,
+               CASE WHEN r.post_id IS NOT NULL THEN 'post' ELSE 'comment' END AS target_type,
+               COALESCE(p.body, c.body) AS reported_content
+        FROM content_reports r
+        JOIN app_users u ON u.id = r.reporter_id
+        LEFT JOIN community_posts p ON p.id = r.post_id
+        LEFT JOIN community_comments c ON c.id = r.comment_id
+        ORDER BY r.created_at DESC LIMIT 250
+      `);
+      return { data: result.rows, meta: { count: result.rowCount, limit: 250 } };
+    } catch (error) {
+      request.log.error({ err: error }, 'community reports list failed');
+      return reply.code(503).send({ error: 'data_unavailable' });
+    }
+  });
+  app.patch<{ Params: { id: string } }>('/api/v1/admin/community-reports/:id', { preHandler: authorize }, async (request, reply) => {
+    if (!pool) return reply.code(503).send({ error: 'database_not_configured' });
+    if (!uuid.safeParse(request.params.id).success) return reply.code(400).send({ error: 'invalid_id' });
+    const parsed = z.object({ status: reportStatus }).strict().safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_request', details: parsed.error.flatten() });
+    try {
+      const result = await pool.query(
+        'UPDATE content_reports SET status = $1 WHERE id = $2 RETURNING id, status',
+        [parsed.data.status, request.params.id],
+      );
+      if (!result.rowCount) return reply.code(404).send({ error: 'record_not_found' });
+      return { data: result.rows[0] };
+    } catch (error) {
+      request.log.error({ err: error }, 'community report update failed');
+      return reply.code(409).send({ error: 'record_not_updated' });
+    }
+  });
+
   app.get('/api/v1/admin/overview', { preHandler: authorize }, async (request, reply) => {
     if (!pool) return reply.code(503).send({ error: 'database_not_configured' });
     try {
