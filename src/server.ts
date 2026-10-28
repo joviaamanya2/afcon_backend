@@ -19,6 +19,8 @@ const env = z.object({
   ADMIN_API_TOKEN: z.string().min(32).optional(),
   AUTH_TOKEN_SECRET: z.string().min(32).optional(),
   COMMUNITY_MEDIA_DIR: z.string().default('community-media'),
+  VENUE_IMAGE_DIR: z.string().default('venue-images'),
+  PLAYER_IMAGE_DIR: z.string().default('player-images'),
   PUBLIC_API_BASE_URL: z.string().url().optional(),
   AI_PROVIDER_API_KEY: z.string().optional(),
   AI_PROVIDER_BASE_URL: z.string().url().default('https://api.deepseek.com/v1'),
@@ -122,7 +124,7 @@ for (const [resource, definition] of Object.entries(resources) as [ResourceName,
              FROM standings s JOIN teams t ON t.id = s.team_id
              WHERE ${clauses.join(' AND ')} ORDER BY s.group_code, s.position LIMIT $${values.length}`
           : isLineupList
-            ? `SELECT l.*, p.name AS player_name, t.name AS team_name
+            ? `SELECT l.*, p.name AS player_name, p.photo_url, t.name AS team_name
                FROM match_lineups l JOIN players p ON p.id = l.player_id JOIN teams t ON t.id = l.team_id
                WHERE ${clauses.join(' AND ')} ORDER BY l.is_starting DESC, l.shirt_number LIMIT $${values.length}`
             : isEventList
@@ -139,7 +141,14 @@ for (const [resource, definition] of Object.entries(resources) as [ResourceName,
   });
 }
 
-registerAdminRoutes(app, pool, env.ADMIN_API_TOKEN);
+registerAdminRoutes(
+  app,
+  pool,
+  env.ADMIN_API_TOKEN,
+  env.VENUE_IMAGE_DIR,
+  env.PLAYER_IMAGE_DIR,
+  env.PUBLIC_API_BASE_URL,
+);
 registerFanAuthRoutes(app, pool, env.AUTH_TOKEN_SECRET);
 registerFanRoutes(app, pool, env.AUTH_TOKEN_SECRET, env.COMMUNITY_MEDIA_DIR, env.PUBLIC_API_BASE_URL);
 

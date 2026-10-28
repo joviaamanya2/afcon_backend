@@ -224,7 +224,7 @@ export function registerFanRoutes(
       }
       const { rows } = await client.query<{ id: string }>(
         `INSERT INTO community_posts (user_id, body, status)
-         VALUES ($1, $2, 'pending') RETURNING id`,
+         VALUES ($1, $2, 'published') RETURNING id`,
         [requestUserId(request), parsed.data.content],
       );
       const postId = rows[0]!.id;
@@ -257,7 +257,7 @@ export function registerFanRoutes(
       const updated = await client.query(
         `UPDATE community_posts
          SET body = COALESCE($1, body),
-             status = CASE WHEN status = 'published' THEN 'pending' ELSE status END
+             status = 'published'
          WHERE id = $2 AND user_id = $3 AND status IN ('pending', 'published')
          RETURNING id`,
         [parsed.data.content ?? null, params.data.id, userId],

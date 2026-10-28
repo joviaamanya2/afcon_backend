@@ -1,4 +1,6 @@
-import { timingSafeEqual } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import type { FastifyInstance, preHandlerHookHandler } from 'fastify';
 import type { Pool } from 'pg';
 import { z } from 'zod';
@@ -6,6 +8,33 @@ import { z } from 'zod';
 const uuid = z.string().uuid();
 const dateTime = z.string().datetime({ offset: true }).nullable().optional();
 const publish = z.boolean().optional();
+const maxVenueImageBytes = 8 * 1024 * 1024;
+const venueImageTypes = {
+  'image/jpeg': {
+    extension: 'jpg',
+    matches: (image: Buffer) => image[0] === 0xff && image[1] === 0xd8 && image[2] === 0xff,
+  },
+  'image/png': {
+    extension: 'png',
+    matches: (image: Buffer) => image.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
+  },
+  'image/webp': {
+    extension: 'webp',
+    matches: (image: Buffer) => image.toString('ascii', 0, 4) === 'RIFF' && image.toString('ascii', 8, 12) === 'WEBP',
+  },
+} as const;
+
+function competitionSlug(name: string, season: string): string {
+  const slugPart = (value: string) => value
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
+  const nameSlug = slugPart(name).slice(0, 90).replace(/-+$/g, '') || 'competition';
+  const seasonSlug = slugPart(season).slice(0, 20).replace(/-+$/g, '');
+  return `${nameSlug}-${seasonSlug}`.slice(0, 120).replace(/-+$/g, '');
+}
 
 const collections = {
   competitions: {
@@ -15,7 +44,7 @@ const collections = {
       name: 'name', slug: 'slug', season: 'season', country: 'country',
       startsAt: 'starts_at', endsAt: 'ends_at', published: 'published',
     },
-    create: z.object({ name: z.string().trim().min(2).max(120), slug: z.string().trim().min(2).max(120), season: z.string().trim().min(4).max(20), country: z.string().trim().max(100).optional(), startsAt: dateTime, endsAt: dateTime, published: publish }),
+    create: z.object({ name: z.string().trim().min(2).max(120), slug: z.string().trim().min(2).max(120).optional(), season: z.string().trim().min(4).max(20), country: z.string().trim().max(100).optional(), startsAt: dateTime, endsAt: dateTime, published: publish }),
   },
   teams: {
     table: 'teams',
@@ -25,7 +54,7 @@ const collections = {
       region: 'region', crestUrl: 'crest_url', coach: 'coach',
       competitionId: 'competition_id', published: 'published',
     },
-    create: z.object({ name: z.string().trim().min(2).max(120), shortName: z.string().trim().max(30).optional(), countryCode: z.string().trim().length(3).optional(), region: z.string().trim().max(80).optional(), crestUrl: z.string().url().optional(), coach: z.string().trim().max(120).optional(), competitionId: uuid.optional(), published: publish }),
+    create: z.object({ name: z.string().trim().min(2).max(120), shortName: z.string().trim().max(30).optional(), countryCode: z.string().trim().transform((value) => value.startsWith('+') ? value : value.toUpperCase()).refine((value) => /^[A-Z]{3}$/.test(value) || /^\+[1-9]\d{0,2}$/.test(value), 'Enter a three-letter code such as UGA or a calling code such as +256.').optional(), region: z.string().trim().max(80).optional(), crestUrl: z.string().url().optional(), coach: z.string().trim().max(120).optional(), competitionId: uuid.optional(), published: publish }),
   },
   players: {
     table: 'players',
@@ -55,11 +84,11 @@ const collections = {
     order: 'name',
     fields: {
       name: 'name', city: 'city', country: 'country', address: 'address',
-      latitude: 'latitude', longitude: 'longitude', capacity: 'capacity',
+      imageUrl: 'image_url', capacity: 'capacity',
       accessibilityInfo: 'accessibility_info', transportInfo: 'transport_info',
       timezone: 'timezone', published: 'published',
     },
-    create: z.object({ name: z.string().trim().min(2).max(160), city: z.string().trim().min(2).max(100), country: z.string().trim().max(100).optional(), address: z.string().trim().max(240).optional(), latitude: z.number().min(-90).max(90).nullable().optional(), longitude: z.number().min(-180).max(180).nullable().optional(), capacity: z.number().int().positive().nullable().optional(), accessibilityInfo: z.string().max(2000).optional(), transportInfo: z.string().max(2000).optional(), timezone: z.string().max(80).optional(), published: publish }),
+    create: z.object({ name: z.string().trim().min(2).max(160), city: z.string().trim().min(2).max(100), country: z.string().trim().max(100).optional(), address: z.string().trim().max(240).optional(), imageUrl: z.string().url().nullable().optional(), capacity: z.number().int().positive().nullable().optional(), accessibilityInfo: z.string().max(2000).optional(), transportInfo: z.string().max(2000).optional(), timezone: z.string().max(80).optional(), published: publish }),
   },
   news: {
     table: 'articles',
@@ -101,7 +130,7 @@ const collections = {
   },
   lineups: {
     table: 'match_lineups',
-    order: 'is_starting DESC, shirt_number',
+    order: 'match_id, team_id, is_starting DESC, shirt_number',
     fields: { matchId: 'match_id', teamId: 'team_id', playerId: 'player_id', isStarting: 'is_starting', shirtNumber: 'shirt_number', position: 'position', formation: 'formation', published: 'published' },
     create: z.object({ matchId: uuid, teamId: uuid, playerId: uuid, isStarting: z.boolean(), shirtNumber: z.number().int().min(1).max(99).nullable().optional(), position: z.string().max(40).optional(), formation: z.string().max(20).optional(), published: publish }),
   },
@@ -113,7 +142,74 @@ function isCollection(value: string): value is CollectionName {
   return Object.hasOwn(collections, value);
 }
 
-export function registerAdminRoutes(app: FastifyInstance, pool: Pool | undefined, adminToken: string | undefined): void {
+function registerImageRoutes(
+  app: FastifyInstance,
+  authorize: preHandlerHookHandler,
+  uploadPath: string,
+  publicPath: string,
+  imageDirectory: string,
+  publicApiBaseUrl: string | undefined,
+  imageLabel: string,
+): void {
+  app.post(uploadPath, {
+    preHandler: authorize,
+    bodyLimit: 12 * 1024 * 1024,
+  }, async (request, reply) => {
+    const parsed = z.object({
+      mimeType: z.enum(['image/jpeg', 'image/png', 'image/webp']),
+      data: z.string().regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/),
+    }).strict().safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_image' });
+
+    const image = Buffer.from(parsed.data.data, 'base64');
+    const imageType = venueImageTypes[parsed.data.mimeType];
+    if (!image.length || image.length > maxVenueImageBytes) {
+      return reply.code(413).send({ error: 'image_size_exceeded', maxBytes: maxVenueImageBytes });
+    }
+    if (!imageType.matches(image)) return reply.code(415).send({ error: 'image_content_mismatch' });
+
+    const filename = `${randomUUID()}.${imageType.extension}`;
+    const filePath = path.join(imageDirectory, filename);
+    try {
+      await mkdir(imageDirectory, { recursive: true });
+      await writeFile(filePath, image, { flag: 'wx' });
+      const baseUrl = publicApiBaseUrl?.replace(/\/+$/, '') ?? `${request.protocol}://${request.headers.host}`;
+      return reply.code(201).send({ data: { url: `${baseUrl}${publicPath}/${filename}` } });
+    } catch (error) {
+      await rm(filePath, { force: true }).catch(() => undefined);
+      request.log.error({ err: error }, `${imageLabel} image upload failed`);
+      return reply.code(503).send({ error: `${imageLabel}_image_upload_unavailable` });
+    }
+  });
+
+  app.get<{ Params: { filename: string } }>(`${publicPath}/:filename`, async (request, reply) => {
+    const match = request.params.filename.match(/^([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})\.(jpg|png|webp)$/i);
+    if (!match) return reply.code(404).send({ error: 'image_not_found' });
+    const contentTypes = { jpg: 'image/jpeg', png: 'image/png', webp: 'image/webp' } as const;
+    const filePath = path.join(imageDirectory, request.params.filename);
+    try {
+      const image = await readFile(filePath);
+      return reply
+        .type(contentTypes[match[2] as keyof typeof contentTypes])
+        .header('Content-Length', image.length)
+        .header('Cache-Control', 'public, max-age=31536000, immutable')
+        .send(image);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return reply.code(404).send({ error: 'image_not_found' });
+      request.log.error({ err: error }, `${imageLabel} image retrieval failed`);
+      return reply.code(503).send({ error: `${imageLabel}_image_unavailable` });
+    }
+  });
+}
+
+export function registerAdminRoutes(
+  app: FastifyInstance,
+  pool: Pool | undefined,
+  adminToken: string | undefined,
+  venueImageDirectory: string,
+  playerImageDirectory: string,
+  publicApiBaseUrl?: string,
+): void {
   const authorize: preHandlerHookHandler = async (request, reply) => {
     if (!pool) return reply.code(503).send({ error: 'database_not_configured' });
     if (!adminToken) return reply.code(503).send({ error: 'admin_token_not_configured' });
@@ -125,6 +221,102 @@ export function registerAdminRoutes(app: FastifyInstance, pool: Pool | undefined
       return reply.code(401).send({ error: 'unauthorized' });
     }
   };
+
+  app.post('/api/v1/admin/lineups/batch', { preHandler: authorize }, async (request, reply) => {
+    if (!pool) return reply.code(503).send({ error: 'database_not_configured' });
+    const schema = z.object({
+      matchId: uuid,
+      teamId: uuid,
+      formation: z.string().trim().min(3).max(20),
+      published: z.boolean(),
+      players: z.array(z.object({
+        playerId: uuid,
+        position: z.string().trim().min(1).max(40),
+        shirtNumber: z.number().int().min(1).max(99).nullable(),
+        isStarting: z.boolean(),
+      }).strict()).min(1).max(30),
+    }).strict().refine(
+      (lineup) => new Set(lineup.players.map((player) => player.playerId)).size === lineup.players.length,
+      { message: 'A player can only appear once in a team line-up.', path: ['players'] },
+    ).refine(
+      (lineup) => lineup.players.filter((player) => player.isStarting).length <= 11,
+      { message: 'A team can have at most 11 starting players.', path: ['players'] },
+    );
+    const parsed = schema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_request', details: parsed.error.flatten() });
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const match = await client.query(
+        'SELECT id FROM matches WHERE id = $1 AND (home_team_id = $2 OR away_team_id = $2)',
+        [parsed.data.matchId, parsed.data.teamId],
+      );
+      if (!match.rowCount) {
+        await client.query('ROLLBACK');
+        return reply.code(400).send({ error: 'team_not_in_match', message: 'Choose a team that is playing in the selected match.' });
+      }
+
+      const playerIds = parsed.data.players.map((player) => player.playerId);
+      const roster = await client.query(
+        'SELECT id FROM players WHERE team_id = $1 AND id = ANY($2::uuid[])',
+        [parsed.data.teamId, playerIds],
+      );
+      if (roster.rowCount !== playerIds.length) {
+        await client.query('ROLLBACK');
+        return reply.code(400).send({ error: 'player_not_in_team', message: 'Every selected player must belong to the selected team.' });
+      }
+
+      await client.query(
+        'DELETE FROM match_lineups WHERE match_id = $1 AND team_id = $2',
+        [parsed.data.matchId, parsed.data.teamId],
+      );
+      for (const player of parsed.data.players) {
+        await client.query(
+          `INSERT INTO match_lineups
+             (match_id, team_id, player_id, is_starting, shirt_number, position, formation, published)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [
+            parsed.data.matchId,
+            parsed.data.teamId,
+            player.playerId,
+            player.isStarting,
+            player.shirtNumber,
+            player.position,
+            parsed.data.formation,
+            parsed.data.published,
+          ],
+        );
+      }
+      await client.query('COMMIT');
+      return reply.code(200).send({ data: { matchId: parsed.data.matchId, teamId: parsed.data.teamId, count: playerIds.length } });
+    } catch (error) {
+      await client.query('ROLLBACK');
+      request.log.error({ err: error }, 'admin lineup batch save failed');
+      return reply.code(409).send({ error: 'lineup_not_saved', message: 'The full line-up could not be saved.' });
+    } finally {
+      client.release();
+    }
+  });
+
+  registerImageRoutes(
+    app,
+    authorize,
+    '/api/v1/admin/venue-images',
+    '/api/v1/venue-images',
+    venueImageDirectory,
+    publicApiBaseUrl,
+    'venue',
+  );
+  registerImageRoutes(
+    app,
+    authorize,
+    '/api/v1/admin/player-images',
+    '/api/v1/player-images',
+    playerImageDirectory,
+    publicApiBaseUrl,
+    'player',
+  );
 
   const moderationStatus = z.enum(['pending', 'published', 'hidden', 'removed']);
   const moderationUpdate = z.object({ status: moderationStatus }).strict();
@@ -242,6 +434,17 @@ export function registerAdminRoutes(app: FastifyInstance, pool: Pool | undefined
            JOIN teams away ON away.id = m.away_team_id
            JOIN competitions c ON c.id = m.competition_id
            ORDER BY m.kickoff_at DESC LIMIT $1`
+        : request.params.resource === 'lineups'
+          ? `SELECT l.*, p.name AS player_name, p.photo_url, t.name AS team_name,
+                    m.kickoff_at, home.name AS home_team, away.name AS away_team
+             FROM match_lineups l
+             JOIN players p ON p.id = l.player_id
+             JOIN teams t ON t.id = l.team_id
+             JOIN matches m ON m.id = l.match_id
+             JOIN teams home ON home.id = m.home_team_id
+             JOIN teams away ON away.id = m.away_team_id
+             ORDER BY m.kickoff_at DESC, l.team_id, l.is_starting DESC, l.shirt_number
+             LIMIT $1`
         : `SELECT * FROM ${collection.table} ORDER BY ${collection.order} LIMIT $1`;
       const result = await pool.query(sql, [limit]);
       return { data: result.rows, meta: { count: result.rowCount, limit } };
@@ -255,7 +458,16 @@ export function registerAdminRoutes(app: FastifyInstance, pool: Pool | undefined
     if (!pool) return reply.code(503).send({ error: 'database_not_configured' });
     if (!isCollection(request.params.resource)) return reply.code(404).send({ error: 'unknown_resource' });
     const collection = collections[request.params.resource];
-    const parsed = collection.create.safeParse(request.body);
+    const body = request.body && typeof request.body === 'object' && !Array.isArray(request.body)
+      ? request.body as Record<string, unknown>
+      : {};
+    const createBody = request.params.resource === 'competitions' &&
+      typeof body.name === 'string' &&
+      typeof body.season === 'string' &&
+      (typeof body.slug !== 'string' || body.slug.trim() === '')
+      ? { ...body, slug: competitionSlug(body.name.trim(), body.season.trim()) }
+      : request.body;
+    const parsed = collection.create.safeParse(createBody);
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_request', details: parsed.error.flatten() });
     const values = Object.entries(parsed.data).filter(([, value]) => value !== undefined);
     const columns = values.map(([key]) => collection.fields[key as keyof typeof collection.fields]);

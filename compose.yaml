@@ -13,6 +13,8 @@ services:
       - afcon-postgres-data:/var/lib/postgresql/data
       - ./db/migrations/001_initial.sql:/docker-entrypoint-initdb.d/001_initial.sql:ro
       - ./db/migrations/002_fan_accounts_community.sql:/docker-entrypoint-initdb.d/002_fan_accounts_community.sql:ro
+      - ./db/migrations/003_venue_images.sql:/docker-entrypoint-initdb.d/003_venue_images.sql:ro
+      - ./db/migrations/004_team_calling_codes.sql:/docker-entrypoint-initdb.d/004_team_calling_codes.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d afcon_fan"]
       interval: 5s
