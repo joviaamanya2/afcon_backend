@@ -38,9 +38,38 @@ const pool = env.DATABASE_URL
     })
   : undefined;
 
-await app.register(helmet);
+await app.register(helmet, {
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+});
+
+const configuredOrigins = env.APP_ORIGINS.split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
 await app.register(cors, {
-  origin: env.APP_ORIGINS.split(',').map((origin) => origin.trim()),
+  origin: (origin, cb) => {
+    if (!origin) {
+      cb(null, true);
+      return;
+    }
+    if (configuredOrigins.includes(origin) || configuredOrigins.includes('*')) {
+      cb(null, true);
+      return;
+    }
+    // Allow any localhost, 127.0.0.1, or local LAN IP on any port, or if in development
+    const isLocalhostOrLan =
+      /^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+)(:\d+)?$/.test(
+        origin,
+      );
+    if (isLocalhostOrLan || env.NODE_ENV === 'development') {
+      cb(null, true);
+      return;
+    }
+    cb(new Error('Not allowed by CORS'), false);
+  },
+  credentials: true,
+  methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Authorization', 'Content-Type', 'Accept', 'Origin', 'X-Requested-With'],
 });
 
 app.get('/health', async (_request, reply) => {
@@ -112,7 +141,9 @@ for (const [resource, definition] of Object.entries(resources) as [ResourceName,
     values.push(limit);
     try {
       const sql = isMatchList
-        ? `SELECT m.*, home.name AS home_team, away.name AS away_team, v.name AS venue_name, c.name AS competition_name
+        ? `SELECT m.*, home.name AS home_team, home.crest_url AS home_crest_url,
+                  away.name AS away_team, away.crest_url AS away_crest_url,
+                  v.name AS venue_name, c.name AS competition_name
            FROM matches m
            JOIN teams home ON home.id = m.home_team_id
            JOIN teams away ON away.id = m.away_team_id
@@ -124,7 +155,7 @@ for (const [resource, definition] of Object.entries(resources) as [ResourceName,
              FROM standings s JOIN teams t ON t.id = s.team_id
              WHERE ${clauses.join(' AND ')} ORDER BY s.group_code, s.position LIMIT $${values.length}`
           : isLineupList
-            ? `SELECT l.*, p.name AS player_name, p.photo_url, t.name AS team_name
+            ? `SELECT l.*, p.name AS player_name, p.photo_url, t.name AS team_name, t.crest_url AS team_crest_url
                FROM match_lineups l JOIN players p ON p.id = l.player_id JOIN teams t ON t.id = l.team_id
                WHERE ${clauses.join(' AND ')} ORDER BY l.is_starting DESC, l.shirt_number LIMIT $${values.length}`
             : isEventList

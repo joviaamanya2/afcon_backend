@@ -386,14 +386,17 @@ export function registerAdminRoutes(app, pool, adminToken, venueImageDirectory, 
            JOIN competitions c ON c.id = m.competition_id
            ORDER BY m.kickoff_at DESC LIMIT $1`
                 : request.params.resource === 'lineups'
-                    ? `SELECT l.*, p.name AS player_name, p.photo_url, t.name AS team_name,
-                    m.kickoff_at, home.name AS home_team, away.name AS away_team
+                    ? `SELECT l.*, p.name AS player_name, p.photo_url, t.name AS team_name, t.crest_url AS team_crest_url,
+                    m.kickoff_at, m.stage, v.name AS venue_name,
+                    home.name AS home_team, home.crest_url AS home_crest_url,
+                    away.name AS away_team, away.crest_url AS away_crest_url
              FROM match_lineups l
              JOIN players p ON p.id = l.player_id
              JOIN teams t ON t.id = l.team_id
              JOIN matches m ON m.id = l.match_id
              JOIN teams home ON home.id = m.home_team_id
              JOIN teams away ON away.id = m.away_team_id
+             LEFT JOIN venues v ON v.id = m.venue_id
              ORDER BY m.kickoff_at DESC, l.team_id, l.is_starting DESC, l.shirt_number
              LIMIT $1`
                     : `SELECT * FROM ${collection.table} ORDER BY ${collection.order} LIMIT $1`;
